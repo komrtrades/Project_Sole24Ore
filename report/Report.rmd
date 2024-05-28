@@ -1,0 +1,137 @@
+---
+title: "Sole 24 Ore Text Analysis"
+author: "Marco Cavallari, Maria Sole Chiaramonti"
+date: "`r Sys.Date()`"
+---
+
+```{r, "data_loading", echo=FALSE, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(udpipe)
+library(wordcloud)
+library(RColorBrewer)
+library(tm)
+library(rvest)
+library(tidyverse)
+library(tidytext)
+library(readtext)
+library(SnowballC)
+library(widyr)
+library(ggraph)
+library(igraph)
+library(proxy)
+library(cluster)
+load("../data/Data_Preparation_Image.RData")
+```
+
+# Introduction
+
+This report is the result of a text analysis on the articles published by the Italian newspaper "Il Sole 24 Ore" during the past month. The analysis is divided in two parts: an exploration of the data at hand, including dictionary analysis, wordclouds, document and words clustering, and topic modeling, and a sentiment analysis on the articles.
+
+# Data
+
+The data used for this analysis has been collected through a web scraping algorithm, and has been manipulated in order to obtain an environment with the following objects:
+
+df_raw: dataset containing raw data scraped from Sole24Ore. It contains the title, subtitle, date of publication, author, category, and text of each article, when available.
+
+x: we used udpipe package to tokenize and lemmatize the text of each article, and then filtered it to only keep nouns, verbs, and foreign words. All other datasets are derived from this one.
+
+df_words: tokens in the corpus, grouped by lemma. Lemmas are assigned a frequency and a weight.
+
+df_clean: this dataset contains all the information of df_raw, and the reconstructed text of each article, after the lemmatization process.
+
+crp: we used the tm package to create a corpus from df_clean.
+
+tdm, mtdm, tdm.w, mtdm.w: term document matrices, created from crp, with different weighting schemes.
+
+dtm, mdtm, dtm.w, mdtm.w: document term matrices with different weighting schemes.
+
+stocks: a dataframe containing ticker and company name of 394 italian and US stocks. We will use this dataset to identify when an article is talking about a specific company.
+
+
+# Exploratory Analysis
+
+From an initial analysis of the dictionary of the corpus, we can see which are the most frequent lemmas in the articles. Figure 1 shows that many of the most frequent lemmas are about italian and global economy, finance, politics, and work. This is not surprising, as the newspaper is specialized in these topics. 
+
+```{r, fig.cap="Figure 1", "Lemma Frequency"}
+df_words %>% arrange(-freq) %>% slice(1:20) %>% 
+    ggplot(aes(x = reorder(word, freq), y = freq)) +
+    geom_col() +
+    coord_flip() +
+    theme_light() +
+    labs(x = "Word", y = "Frequency")
+```
+
+A better approach to evaluate the importance of words in a collection of documents is to assign each lemma a weight computed as the product of its frequency and its inverse document frequency. Figure 2 shows the 20 lemmas with the highest weight. We can see that the most significant words have changed, but the topics are still the same.
+
+```{r, fig.cap="Figure 2", "Lemma Weight"}
+df_words %>% arrange(-weight) %>% slice(1:20) %>% 
+    ggplot(aes(x = reorder(word, weight), y = weight)) +
+    geom_col() +
+    coord_flip() +
+    theme_light() +
+    labs(x = "Word", y = "Weight")
+```
+
+We also looked at some associations between words with the function FindAssocs. It can be useful to understand which words are most correlated with the word "crescita", or "growth": in this case, we obtain the words "rallentamento", its opposite, "semestre", "andamento", "prospettivo", and "tendere". Other than "rallentamento", all these words are related to the concept of growth, and they are all positive. This is a good sign, as it means that the articles are not talking about a negative growth, but rather about a positive one, or at least a neutral one. 
+
+```{r, "Associations"}
+findAssocs(tdm, "crescita", corlimit = 0.5)
+```
+
+This function also finds applications when we are interested in a specific topic, for example in banking. Associations are found between "bank" and other key words that can be used to obtain some insights. For example, among the associations we see "profitto", which might suggest that the sector is going through a period of profit, and some stock tickers like "bancobpm", "credem", "bper", etc, which could be useful to identify the banks in which the public interest is highest. Some big players like "Intesa SanPaolo" are not present, but it's most likely due to the fact that the lemmatization process has changed the lemma in such a way that it is not recognized as a stock anymore.
+
+```{r, "Associations 2"}
+findAssocs(tdm, "banca", corlimit = 0.5)
+```
+
+We show one last example with the word "profitto": here we also find strong associations with several stocks and banks, but we must be careful about the conclusions we draw from this. The word "profitto" is not necessarily associated with the concept of profit, in fact in this case it is more likely to be used in the context of "tassa sugli extra profitti", a tax on extra profits that the government has introduced for banks.
+
+```{r, "Associations 3"}
+findAssocs(tdm, "profitto", corlimit = 0.7)
+```
+
+Wordclouds can give us a more visual way to see which words are being used in a corpus (or a single document), and make it easier for us to get a first idea on the topic at hand.
+
+```{r, fig.width=10, fig.height=5, fig.cap="Figure 3", "Wordclouds"}
+par(mfrow=c(1,2))
+
+wordcloud(words=df_words$word,
+ freq=df_words$freq,
+ scale=c(2.3,0.4),
+ max.words =80,
+ random.order =FALSE,
+ colors= brewer.pal(8,"Dark2"))
+ text(0.5,1,"Wordcloud of Sole 24 Ore Financial News - Freq",cex=1,font= 2)
+
+wordcloud(words=df_words$word,
+ freq=df_words$weight,
+ scale=c(1.5,0.25),
+ max.words =80,
+ random.order =FALSE,
+ colors= brewer.pal(8,"Dark2"))
+ text(0.5,1,"Wordcloud of Sole 24 Ore Financial News - Weight",cex=1,font= 2)
+```
+
+# Topic Modeling
+
+We began our topic analysis by clustering words. The first step was choosing the optimal number of clusters, and the optimal level of sparsity. Since removing sparse terms heavily affects the results of clustering, we ideated a smart way to choose the parameters k, i.e. the sparsity level, and nclu, at the same time. We decided to use the silhouette method, which is a measure of how similar an object is to its own cluster compared to other clusters. We computed the silhouette for different values of k (resulting in different distance matrices), and for each k we computed the silhouette score for different numbers of clusters, from 2 to 20. For each sparsity level k, we also reported the number of lemmas in the resulting matrix. We wanted to keep at least about 50% of the lemmas, so we chose the sparsity level k = 0.96, and chose a number of clusters nclu = 10, which has a good trade-off between gain in silhouette score and number of lemmas kept.
+
+```{r, "Silhouette"}
+par(mfrow=c(5,2))
+par(mar=c(2.5,2.5,2.5,2.5))
+for (k in seq(0.8,0.99,0.02)) {
+    dst.tdm <- dist(as.matrix(removeSparseTerms(tdm, k)), method = "cosine")
+    n_lemmas <- attr(dst.tdm, "Size")
+    hcl.tdm <- hclust(dst.tdm, method = "ward.D2") # HERE WE CAN ALSO CHOOSE THE METHOD.
+    vsilIn <- c()
+    for (i in 2:20) {
+        vsilIn <- c(vsilIn, mean(silhouette(x = cutree(hcl.tdm, i), dist = dst.tdm)[, 3]))
+    }
+
+    plot(x = seq(2:20), y = vsilIn,   
+        type = "b",
+        xlab = "Number of clusters", 
+        ylab = "Silhouette", 
+        main = paste0("k = ", k, " - Number of total lemmas: ", n_lemmas)) 
+}
+```
